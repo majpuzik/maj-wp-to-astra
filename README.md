@@ -175,6 +175,11 @@ site, AI adds nothing.
 
 ## Method (the proven workflow)
 
+> **One command** ties the ends together: `tools/wp-to-astra.sh "<wp-cmd>"` runs the
+> dry Elementor test first (and offers to convert if any Elementor pages remain), then
+> at the end asks *"Save as UpdraftPlus backup?"* and produces a real one if you say yes.
+> The numbered steps below are what it orchestrates (+ the verify steps you run between).
+
 1. **Duplicate the site** (new DB + dir + port). Keep the original running as the
    visual reference.
 2. **Analyze** — `tools/analyze-elementor.php` → decide fit (see table above).
@@ -273,16 +278,32 @@ parity is a freeze, not a conversion** — two render engines differ at the sub-
 
 ## Packaging back into an UpdraftPlus backup
 
-`tools/package-updraft.sh` rebuilds an UpdraftPlus-format archive
-(`backup_<DATE>_<Name>_<nonce>-{db.gz,plugins.zip,themes.zip,uploads.zip,others.zip}`,
-wrapped in one zip). Component zips keep `plugins/ themes/ uploads/` at their root; the
-`db.gz` is a `mysqldump` + an UpdraftPlus header.
+`tools/package-updraft.sh` generates a **real** UpdraftPlus backup by driving the
+**plugin itself** — `do_action("updraft_backupnow_backup_all", …)` on the running
+site — then waits for the log to confirm completion and collects the produced files
+(`backup_<DATE>_<Name>_<nonce>-{db,plugins,themes,uploads,others}.*` **plus** the
+`log.<nonce>.txt`).
+
+```bash
+tools/package-updraft.sh "docker exec mysite wp --allow-root" docker:mysite ./out
+tools/package-updraft.sh "wp --path=/var/www/html"           /var/www/html/wp-content/updraft ./out
+```
+
+> **Do not hand-craft the zip set.** A backup assembled by zipping files yourself does
+> **not** restore: UpdraftPlus drives the theme/plugin restore from its own log/manifest,
+> and without it the restorer **skips themes and plugins** — you get the DB restored but
+> the default theme, no CSS, a shuffled menu, dead shortcodes. (Earlier versions of this
+> script hand-zipped and were broken; only the plugin-generated set restores.)
+>
+> The backup is a resumable wp-cron job, so run it against a **live** site (apache/php-fpm)
+> — a headless wp-cli box with no HTTP loopback won't finish it.
+
+**Restore:** drop all the collected files (the `backup_..._*` **and** `log.*.txt`) into
+`wp-content/updraft/` on the target → UpdraftPlus → *Existing backups* → *Rescan local
+folder* → *Restore* (tick Database + Plugins + Themes + Uploads + Others).
 
 > Note: UpdraftPlus **Free has no headless restore** (`perform_restore()` returns `true`
-> but runs no stage). Restore via the UpdraftPlus UI ("Existing Backups" → rescan), or
-> manually (extract components into `wp-content/`, import `db.gz`).
-
-Verify any backup with: `unzip -t zasilka.zip` and `gzcat *-db.gz | grep -c 'CREATE TABLE'`.
+> but runs no stage) — restore via the UI as above.
 
 ## Optional: public hosting behind a Cloudflare tunnel
 
@@ -320,7 +341,13 @@ tools/site-verify.js          ★ multi-dimension original-vs-converted gate (co
                               Catches what a pixel diff can't — a hidden 404 placeholder, a
                               stray extra menu item, a plugin that stopped emitting output.
                               `node tools/site-verify.js <orig-base> <converted-base>`
-tools/package-updraft.sh      build an UpdraftPlus-format archive
+tools/wp-to-astra.sh          ★ end-to-end orchestrator: START runs the dry Elementor
+                              test (+ offers to convert if any remain), END asks "Save as
+                              UpdraftPlus backup?" and makes a real one. AUTO_CONVERT=1 /
+                              AUTO_BACKUP=1 skip the prompts.
+tools/package-updraft.sh      generate a REAL UpdraftPlus backup via the plugin
+                              (do_action backupnow) — NOT a hand-crafted zip (those don't
+                              restore themes/plugins). Run against a live site.
 hosting/docker-compose.yml    WP stack template (sanitized)
 hosting/apache-override.conf  Apache reverse-proxy + AllowOverride
 hosting/wp-config-snippet.php HTTPS-behind-proxy + WP_HOME

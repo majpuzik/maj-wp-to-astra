@@ -1,48 +1,76 @@
 #!/bin/bash
-# Build an UpdraftPlus-compatible archive from a running WP site.
-# Output: zasilka-<NAME>-<DATE>.zip with 5 components in UpdraftPlus format.
+# Generate a REAL UpdraftPlus backup — by the UpdraftPlus plugin itself, NOT by
+# hand-zipping files into backup_..._-{db,plugins,themes,uploads,others}.* names.
 #
-# Usage: package-updraft.sh <WP_CONTENT_DIR> <DB_NAME> <SITE_NAME> <TARGET_URL> <OUT_DIR>
-#   WP_CONTENT_DIR  path to wp-content (must contain plugins/ themes/ uploads/)
-#   DB_NAME         MySQL database of the site
-#   SITE_NAME       label used in the filename (e.g. Catley_Ranch)
-#   TARGET_URL      URL to bake into the DB (e.g. https://example.com) — rewrites local URLs
-#   OUT_DIR         where to write the archive
-set -euo pipefail
+# WHY: a hand-crafted set does NOT restore correctly. UpdraftPlus drives the
+# theme/plugin restore from its own log/manifest; without it the restorer SKIPS
+# themes and plugins (restorer.php move_backup_in / themes_to_restore). You get a
+# site with the DB restored but the *default* theme active — no CSS, shuffled menu,
+# dead shortcodes. Verified the hard way: only the plugin-generated backup restores
+# themes + plugins. (The previous version of this script hand-zipped and was broken.)
+#
+# HOW it works: triggers UpdraftPlus' own "backup now" (do_action), waits for the
+# log to say it completed, then collects the produced files. The backup is a
+# resumable wp-cron job, so the site must be RUNNING behind a webserver
+# (apache/php-fpm) — a headless wp-cli box with no HTTP loopback won't finish it.
+#
+# Usage:
+#   tools/package-updraft.sh "<wp-cmd>" [<updraft-dir>|docker:NAME] [<out-dir>]
+#     <wp-cmd>      how to run wp-cli on the site, quoted. Examples:
+#                     "wp"
+#                     "wp --path=/var/www/html --allow-root"
+#                     "docker exec mysite wp --allow-root"
+#     <updraft-dir> host path to wp-content/updraft to copy files from; or
+#                   "docker:CONTAINER" to docker-cp them out of a container.
+#                   Omit to just print where the files are.
+#     <out-dir>     where to collect the files (default: ./updraft-backup)
+#
+# Ship ALL collected files together (the backup_..._* AND the log.*.txt). Restore =
+# drop them in wp-content/updraft/ on the target, UpdraftPlus -> Existing backups ->
+# Rescan local folder -> Restore (tick Database + Plugins + Themes + Uploads + Others).
+set -uo pipefail
 
-WPC="$1"; DB="$2"; NAME="$3"; URL="$4"; OUT="$5"
-TS=$(date +%Y-%m-%d-%H%M)
-NONCE=$(LC_ALL=C tr -dc 'a-f0-9' </dev/urandom | head -c12)
-B="backup_${TS}_${NAME}_${NONCE}"
-TMP=$(mktemp -d)
+WP="${1:?usage: package-updraft.sh \"<wp-cmd>\" [<updraft-dir>|docker:NAME] [<out-dir>]}"
+UPDR="${2:-}"
+OUT="${3:-./updraft-backup}"
 
-echo "[1/6] db.gz (mysqldump + UpdraftPlus header, URL -> $URL)"
-# IMPORTANT: LC_ALL=C — otherwise macOS sed dies on UTF-8 ("illegal byte sequence")
-mysqldump -u root --single-transaction --no-tablespaces --default-character-set=utf8mb4 "$DB" \
-  | LC_ALL=C sed -E "s#https?://localhost:[0-9]+#${URL}#g" > "$TMP/_body.sql"
-{
-  echo "# WordPress MySQL database backup"
-  echo "# Created by UpdraftPlus version 1.26.4 (https://updraftplus.com)"
-  echo "# Backup of: $URL"
-  echo "# Home URL: $URL"
-  echo "# Content URL: $URL/wp-content"
-  echo "# Table prefix: wp_"
-  echo "# Site info: multisite=0"
-  echo "# Site info: end"
-  echo ""
-  cat "$TMP/_body.sql"
-} | gzip > "$TMP/${B}-db.gz"
+run() { eval "$WP $*"; }
 
-echo "[2/6] plugins.zip"; ( cd "$WPC" && zip -r -q -X "$TMP/${B}-plugins.zip" plugins/ )
-echo "[3/6] themes.zip";  ( cd "$WPC" && zip -r -q -X "$TMP/${B}-themes.zip" themes/ )
-echo "[4/6] uploads.zip"; ( cd "$WPC" && zip -r -q -X "$TMP/${B}-uploads.zip" uploads/ -x "uploads/elementor/*" )
-echo "[5/6] others.zip (non-standard wp-content dirs)"
-OTHERS=$(cd "$WPC" && ls -d */ 2>/dev/null | sed 's#/##' | grep -vE '^(plugins|themes|uploads|upgrade|updraft)$' || true)
-[ -n "$OTHERS" ] && ( cd "$WPC" && zip -r -q -X "$TMP/${B}-others.zip" $OTHERS )
+echo "[1/4] ensuring UpdraftPlus is active"
+run plugin is-active updraftplus >/dev/null 2>&1 \
+  || run plugin install updraftplus --activate >/dev/null 2>&1 \
+  || run plugin activate updraftplus >/dev/null 2>&1 || true
 
-echo "[6/6] outer archive (store — components are already compressed)"
-OUTZIP="$OUT/zasilka-${NAME}-${TS}.zip"
-( cd "$TMP" && zip -0 -q -X "$OUTZIP" backup_* )
-rm -rf "$TMP"
-echo "Done: $OUTZIP"
-echo "Verify: unzip -t \"$OUTZIP\"; gzcat *-db.gz | grep -c 'CREATE TABLE'"
+echo "[2/4] triggering a full backup (db + plugins + themes + uploads + others)"
+run eval "'do_action(\"updraft_backupnow_backup_all\", array());'" >/dev/null 2>&1
+
+SITE_UPDRAFT=$(run eval "'echo trailingslashit(WP_CONTENT_DIR).\"updraft\";'" 2>/dev/null | tr -d '\r')
+
+echo "[3/4] waiting for completion (up to ~10 min)"
+DONE=""
+for i in $(seq 1 120); do
+  LINE=$(run eval "'\$d=trailingslashit(WP_CONTENT_DIR).\"updraft\"; foreach(glob(\$d.\"/log.*.txt\") as \$f){ if(strpos(file_get_contents(\$f),\"backup succeeded and is now complete\")!==false){ echo basename(\$f); break; } }'" 2>/dev/null | tr -d '\r')
+  [ -n "$LINE" ] && { DONE="$LINE"; break; }
+  sleep 5
+done
+[ -z "$DONE" ] && echo "  WARNING: completion not seen in the log. Run this on a live apache/php-fpm site (the backup needs an HTTP loopback to finish)."
+
+echo "[4/4] collecting backup files -> $OUT"
+mkdir -p "$OUT"
+FILES=$(run eval "'\$d=trailingslashit(WP_CONTENT_DIR).\"updraft/\"; \$l=glob(\$d.\"backup_*\"); usort(\$l, function(\$a,\$b){return filemtime(\$b)-filemtime(\$a);}); if(\$l){ preg_match(\"/backup_[0-9-]+_.+?_[a-f0-9]+/\", basename(\$l[0]), \$m); foreach(glob(\$d.\$m[0].\"*\") as \$f) echo basename(\$f).\"\\n\"; foreach(glob(\$d.\"log.*.txt\") as \$f) echo basename(\$f).\"\\n\"; }'" 2>/dev/null | tr -d '\r')
+
+if [ "${UPDR:0:7}" = "docker:" ]; then
+  C="${UPDR#docker:}"
+  for f in $FILES; do docker cp "$C:$SITE_UPDRAFT/$f" "$OUT/" 2>/dev/null; done
+elif [ -n "$UPDR" ]; then
+  for f in $FILES; do cp "$UPDR/$f" "$OUT/" 2>/dev/null; done
+else
+  echo "  files are on the site at: $SITE_UPDRAFT/"
+  echo "$FILES" | sed 's/^/    /'
+  echo "  (pass <updraft-dir> or docker:NAME to auto-collect them)"
+  exit 0
+fi
+
+echo "Done. Backup set in $OUT:"
+ls -1 "$OUT" 2>/dev/null | sed 's/^/  /'
+echo "Ship ALL of these together (backup_..._* AND log.*.txt)."
