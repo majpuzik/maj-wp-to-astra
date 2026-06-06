@@ -1,0 +1,7 @@
+[{"id":"s1","elType":"section","elements":[{"id":"c1","elType":"column","elements":[
+{"id":"w1","elType":"widget","widgetType":"heading","settings":{"title":"E2E Heading Marker","header_size":"h2"}},
+{"id":"w2","elType":"widget","widgetType":"text-editor","settings":{"editor":"<p>E2E paragraph body marker.</p>"}},
+{"id":"w3","elType":"widget","widgetType":"button","settings":{"text":"E2E Button Marker","link":{"url":"https://example.com/e2e"}}},
+{"id":"w4","elType":"widget","widgetType":"image","settings":{"image":{"url":"https://example.com/e2e.jpg","alt":"E2E Image Marker"}}},
+{"id":"w5","elType":"widget","widgetType":"shortcode","settings":{"shortcode":"[e2e_marker]"}}
+]}]}]

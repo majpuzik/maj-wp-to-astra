@@ -37,7 +37,8 @@ echo "=== wp-to-astra: $WP ==="
 # ---- START: dry test ----------------------------------------------------------
 echo
 echo ">> START: dry test — looking for Elementor pages (changes nothing)"
-EL=$(run eval "'echo (int)\$GLOBALS[\"wpdb\"]->get_var(\"SELECT COUNT(DISTINCT post_id) FROM {\$GLOBALS[\\\"wpdb\\\"]->postmeta} WHERE meta_key=\\\"_elementor_edit_mode\\\" AND meta_value=\\\"builder\\\"\");'" 2>/dev/null | tr -dc '0-9')
+# count Elementor pages the converter would touch (page/post, builder mode)
+EL=$(run post list --post_type=page,post --meta_key=_elementor_edit_mode --meta_value=builder --format=count 2>/dev/null | tr -dc '0-9')
 EL="${EL:-0}"
 run eval-file "$HERE/elementor-ex.php" test 2>/dev/null || true
 
